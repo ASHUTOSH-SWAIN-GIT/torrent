@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 )
 
@@ -172,4 +173,73 @@ func (d *Decoder) readByte() (byte, error) {
 func Unmarshal(data []byte) (map[string]interface{}, error) {
 	d := NewDecoder(bytes.NewReader(data))
 	return d.decodeDict()
+}
+
+func Marshal(v interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+
+	if err := encodeValue(&buf, v); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func encodeValue(w io.Writer, v interface{}) error {
+	switch val := v.(type) {
+	case string:
+		return encodeString(w, []byte(val))
+	case []byte:
+		return encodeString(w, val)
+	case int:
+		return encodeInt(w, int64(val))
+	case int64:
+		return encodeInt(w, val)
+	case []interface{}:
+		return encodeList(w, val)
+	case map[string]interface{}:
+		return encodeDict(w, val)
+	default:
+		return fmt.Errorf("unsupported type: %T", v)
+	}
+}
+
+func encodeInt(w io.Writer, val int64) error {
+	fmt.Fprintf(w, "i%de", val)
+	return nil
+}
+
+func encodeString(w io.Writer, val []byte) error {
+	fmt.Fprintf(w, "%d:", len(val))
+	w.Write(val)
+	return nil
+}
+func encodeList(w io.Writer, val []interface{}) error {
+	w.Write([]byte("l"))
+	for _, item := range val {
+		if err := encodeValue(w, item); err != nil {
+			return err
+		}
+	}
+	w.Write([]byte("e"))
+	return nil
+}
+func encodeDict(w io.Writer, val map[string]interface{}) error {
+	w.Write([]byte("d"))
+	keys := make([]string, 0, len(val))
+	for k := range val {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		if err := encodeString(w, []byte(k)); err != nil {
+			return err
+		}
+		if err := encodeValue(w, val[k]); err != nil {
+			return err
+		}
+	}
+	w.Write([]byte("e"))
+	return nil
 }
