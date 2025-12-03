@@ -80,7 +80,11 @@ func (d *Decoder) decodeInt() (int64, error) {
 
 func (d *Decoder) decodeString(firstByte []byte) ([]byte, error) {
 	var lenBuf bytes.Buffer
-	lenBuf.Write(firstByte)
+	started := false
+	if firstByte != nil && len(firstByte) > 0 {
+		lenBuf.WriteByte(firstByte[0])
+		started = true
+	}
 	for {
 		b := make([]byte, 1)
 		if _, err := d.r.Read(b); err != nil {
@@ -90,6 +94,10 @@ func (d *Decoder) decodeString(firstByte []byte) ([]byte, error) {
 			break
 		}
 		lenBuf.WriteByte(b[0])
+		started = true
+	}
+	if !started {
+		return nil, fmt.Errorf("empty string length")
 	}
 	length, err := strconv.Atoi(lenBuf.String())
 	if err != nil {
@@ -130,35 +138,36 @@ func (d *Decoder) decodeDict() (map[string]interface{}, error) {
 	dict := make(map[string]interface{})
 
 	for {
-		peekByte := make([]byte, 1)
-		if _, err := d.r.Read(peekByte); err != nil {
+		peek := make([]byte, 1)
+		if _, err := d.r.Read(peek); err != nil {
 			return nil, err
 		}
 
-		if peekByte[0] == 'e' {
+		// end of dictionary
+		if peek[0] == 'e' {
 			break
 		}
 
-		d.r = io.MultiReader(bytes.NewReader(peekByte), d.r)
+		// dictionary keys are ALWAYS strings (must start with a digit)
+		if peek[0] < '0' || peek[0] > '9' {
+			return nil, fmt.Errorf("dictionary key must be a string (start with digit), got %c", peek[0])
+		}
 
-		KeyBytes, err := d.decodeValue()
+		// decode as string (we already have the first byte)
+		keyBytes, err := d.decodeString(peek)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid dictionary key: %w", err)
 		}
 
-		key, ok := KeyBytes.([]byte)
-
-		if !ok {
-			return nil, fmt.Errorf("dictionary key must be a byte string")
-		}
-
+		// decode the value normally
 		val, err := d.decodeValue()
 		if err != nil {
 			return nil, err
 		}
-		dict[string(key)] = val
 
+		dict[string(keyBytes)] = val
 	}
+
 	return dict, nil
 }
 
@@ -172,7 +181,15 @@ func (d *Decoder) readByte() (byte, error) {
 
 func Unmarshal(data []byte) (map[string]interface{}, error) {
 	d := NewDecoder(bytes.NewReader(data))
-	return d.decodeDict()
+	val, err := d.decodeValue()
+	if err != nil {
+		return nil, err
+	}
+	dict, ok := val.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("top-level value must be a dictionary, got %T", val)
+	}
+	return dict, nil
 }
 
 func Marshal(v interface{}) ([]byte, error) {

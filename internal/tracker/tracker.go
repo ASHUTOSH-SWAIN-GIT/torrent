@@ -96,8 +96,22 @@ func Announce(url string) ([]Peer, error) {
 		return nil, err
 	}
 
-	peersBin := decoded["peers"].([]byte)
-	return parseCompactPeers(peersBin)
+	peersVal, ok := decoded["peers"]
+	if !ok {
+		return nil, fmt.Errorf("tracker response missing 'peers' field")
+	}
+
+	// Handle compact format (binary)
+	if peersBin, ok := peersVal.([]byte); ok {
+		return parseCompactPeers(peersBin)
+	}
+
+	// Handle list format (list of dictionaries)
+	if peersList, ok := peersVal.([]interface{}); ok {
+		return parseListPeers(peersList)
+	}
+
+	return nil, fmt.Errorf("unexpected peers format: %T", peersVal)
 }
 
 // return the peer list provided by the tracker
@@ -127,5 +141,44 @@ func parseCompactPeers(data []byte) ([]Peer, error) {
 		})
 	}
 
+	return peers, nil
+}
+
+func parseListPeers(peersList []interface{}) ([]Peer, error) {
+	peers := make([]Peer, 0, len(peersList))
+	for _, p := range peersList {
+		peerDict, ok := p.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("peer entry is not a dictionary: %T", p)
+		}
+
+		ipVal, ok := peerDict["ip"]
+		if !ok {
+			return nil, fmt.Errorf("peer missing 'ip' field")
+		}
+		ipStr, ok := ipVal.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("peer 'ip' is not a string: %T", ipVal)
+		}
+
+		portVal, ok := peerDict["port"]
+		if !ok {
+			return nil, fmt.Errorf("peer missing 'port' field")
+		}
+		portInt, ok := portVal.(int64)
+		if !ok {
+			return nil, fmt.Errorf("peer 'port' is not an integer: %T", portVal)
+		}
+
+		ip := net.ParseIP(string(ipStr))
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP address: %s", string(ipStr))
+		}
+
+		peers = append(peers, Peer{
+			IP:   ip,
+			Port: uint16(portInt),
+		})
+	}
 	return peers, nil
 }
