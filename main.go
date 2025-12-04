@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"torrent.ashutosh.net/internal/peer"
 	"torrent.ashutosh.net/internal/tracker"
 )
 
@@ -39,5 +40,19 @@ func main() {
 	fmt.Println("\nPeers returned by tracker:")
 	for _, p := range peers {
 		fmt.Println(p.IP, p.Port)
+	}
+
+	fmt.Println("\n Testing handshake")
+
+	for _, p := range peers {
+		conn, err := peer.ConnectAndHandshake(p, torrent.InfoHash, peerID)
+		if err != nil {
+			fmt.Println("Failed handshake with", p.IP, p.Port, "error:", err)
+			continue
+		}
+
+		fmt.Println("Handshake successful with", p.IP, p.Port)
+		conn.Close()
+		break
 	}
 }
