@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha1"
 	"fmt"
+	"net"
 	"os"
 
 	"torrent.ashutosh.net/internal/peer"
@@ -42,32 +44,78 @@ func main() {
 		fmt.Println(p.IP, p.Port)
 	}
 
-	fmt.Println("\nTesting handshake with first 100 peers...\n")
+	fmt.Println("\nTrying to find one peer for downloading...")
 
-	success := false
-	limit := 100
-	if len(peers) < limit {
-		limit = len(peers)
-	}
+	var conn net.Conn
+	var workingPeer tracker.Peer
+	found := false
 
-	for i := 0; i < limit; i++ {
-		p := peers[i]
+	for _, p := range peers {
 		fmt.Printf("Trying %s:%d ... ", p.IP, p.Port)
 
-		conn, err := peer.ConnectAndHandshake(p, torrent.InfoHash, peerID)
+		c, err := peer.ConnectAndHandshake(p, torrent.InfoHash, peerID)
 		if err != nil {
 			fmt.Println("Failed:", err)
 			continue
 		}
 
-		fmt.Println("SUCCESS")
-		conn.Close()
-		success = true
+		fmt.Println("Connected")
+		conn = c
+		workingPeer = p
+		found = true
 		break
 	}
 
-	if !success {
-		fmt.Println("\nNo successful handshake in first", limit, "peers")
+	if !found {
+		fmt.Println("Could not connect to any peer")
+		return
 	}
 
+	defer conn.Close()
+
+	fmt.Println("\nConnected to peer:", workingPeer.IP, workingPeer.Port)
+
+	// Download first piece
+	pieceIndex := 0
+	pieceLength := torrent.Info.PieceLength
+
+	// Handle last piece length
+	if pieceIndex == len(torrent.Info.Pieces)/20-1 {
+		remaining := torrent.Info.Length - pieceIndex*pieceLength
+		pieceLength = remaining
+	}
+
+	fmt.Println("Downloading piece", pieceIndex)
+
+	pieceData, err := peer.DownloadPiece(conn, pieceIndex, pieceLength)
+	if err != nil {
+		fmt.Println("Download failed:", err)
+		return
+	}
+
+	// Extract expected hash from pieces
+	var expectedHash [20]byte
+	if pieceIndex*20+20 <= len(torrent.Info.Pieces) {
+		copy(expectedHash[:], torrent.Info.Pieces[pieceIndex*20:pieceIndex*20+20])
+	} else {
+		fmt.Println("Invalid piece index")
+		return
+	}
+	actualHash := sha1.Sum(pieceData)
+
+	if expectedHash != actualHash {
+		fmt.Println("Piece verification failed")
+		return
+	}
+
+	fmt.Println("Piece verified")
+
+	// Save piece to file
+	err = os.WriteFile("output_piece.bin", pieceData, 0644)
+	if err != nil {
+		fmt.Println("Failed to save piece", err)
+		return
+	}
+
+	fmt.Println("Piece saved as output_piece.bin")
 }

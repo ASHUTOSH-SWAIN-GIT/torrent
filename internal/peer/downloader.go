@@ -46,6 +46,7 @@ func ReadPiece(r io.Reader) (index int, begin int, block []byte, err error) {
 	return index, begin, block, nil
 }
 
+// sends  request for a whole block and reads the matching peice
 func DownloadBlock(conn net.Conn, index int, begin int, length int) ([]byte, error) {
 
 	// send intrested message to the peer
@@ -59,6 +60,46 @@ func DownloadBlock(conn net.Conn, index int, begin int, length int) ([]byte, err
 	}
 
 	// send request for the block
-	if err := SendRequest(conn , index)
+	if err := SendRequest(conn, index, begin, length); err != nil {
+		return nil, err
+	}
 
+	_, blkBegin, blkData, err := ReadPiece(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	if blkBegin != begin {
+		return nil, fmt.Errorf("unexpected block offset got  %d want %d", blkBegin, begin)
+	}
+
+	if len(blkData) != length {
+		return nil, fmt.Errorf("unexpected block length got %d want %d", len(blkData))
+	}
+
+	return blkData, nil
+
+}
+
+// downloads a torrent peice by requesting  blocks
+func DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int) ([]byte, error) {
+	buf := make([]byte, pieceLength)
+	offset := 0
+
+	for offset < pieceLength {
+		blockSize := DefaultBlockSize
+		if offset+blockSize > pieceLength {
+			blockSize = pieceLength - offset
+		}
+
+		block, err := DownloadBlock(conn, pieceIndex, offset, blockSize)
+		if err != nil {
+			return nil, err
+		}
+
+		copy(buf[offset:], block)
+		offset += blockSize
+	}
+
+	return buf, nil
 }
