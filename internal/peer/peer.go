@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"torrent.ashutosh.net/internal/tracker"
 )
@@ -72,18 +73,25 @@ func ReadHandshake(r io.Reader) (*Handshake, error) {
 func ConnectAndHandshake(p tracker.Peer, infoHash [20]byte, peerID [20]byte) (net.Conn, error) {
 	addr := fmt.Sprintf("%s:%d", p.IP.String(), p.Port)
 
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, 800*time.Millisecond)
 	if err != nil {
 		return nil, err
 	}
 
 	// send handshake
 	hs := NewHandshake(infoHash, peerID)
+
+	// deadline for write handshake
+	conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+
 	_, err = conn.Write(hs.Serialize())
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
+
+	// deadline for read handshake
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 
 	// read handshake from the peer
 	peerHS, err := ReadHandshake(conn)
@@ -91,6 +99,9 @@ func ConnectAndHandshake(p tracker.Peer, infoHash [20]byte, peerID [20]byte) (ne
 		conn.Close()
 		return nil, err
 	}
+
+	// remove all the deadlines after succesful handshake
+	conn.SetDeadline(time.Time{})
 
 	if peerHS.InfoHash != infoHash {
 		conn.Close()

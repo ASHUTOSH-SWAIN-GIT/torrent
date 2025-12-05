@@ -132,8 +132,14 @@ func BuildAnnounceURL(t *bencode.Torrent, peerID [20]byte, port int) (string, er
 }
 
 // send request to the tracker
-func Announce(url string) ([]Peer, error) {
-	resp, err := http.Get(url)
+func Announce(rawURL string, t *bencode.Torrent, peerID [20]byte, port int) ([]Peer, error) {
+
+	// detect if udp
+	if len(rawURL) >= 4 && rawURL[:6] == "udp://" {
+		return udpAnnounce(rawURL, t.InfoHash, peerID, port, t.Info.Length)
+	}
+	// otherwise fall back to  the http one
+	resp, err := http.Get(rawURL)
 	if err != nil {
 		return nil, err
 	}

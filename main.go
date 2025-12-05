@@ -10,7 +10,7 @@ import (
 
 func main() {
 
-	data, err := os.ReadFile("debian-13.2.0-amd64-netinst.iso.torrent")
+	data, err := os.ReadFile("cab4A8WPHeOLLZvbDYW4wySxq4CNFexA1KHNoT8O.torrent")
 	if err != nil {
 		panic(err)
 	}
@@ -32,7 +32,7 @@ func main() {
 	}
 	fmt.Println("Announce URL:", announceURL)
 
-	peers, err := tracker.Announce(announceURL)
+	peers, err := tracker.Announce(announceURL, torrent, peerID, 6881)
 	if err != nil {
 		panic(err)
 	}
