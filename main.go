@@ -10,7 +10,7 @@ import (
 
 func main() {
 
-	data, err := os.ReadFile("ubuntu-24.04.3-desktop-amd64.iso.torrent")
+	data, err := os.ReadFile("debian-13.2.0-amd64-netinst.iso.torrent")
 	if err != nil {
 		panic(err)
 	}

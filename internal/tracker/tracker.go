@@ -25,7 +25,14 @@ func ParseTorrent(data []byte) (*bencode.Torrent, error) {
 		return nil, err
 	}
 
-	infoMap := decoded["info"].(map[string]interface{})
+	infoVal, ok := decoded["info"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing 'info' field")
+	}
+	infoMap, ok := infoVal.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("'info' field is not a dictionary")
+	}
 
 	infoBytes, err := bencode.Marshal(infoMap)
 	if err != nil {
@@ -34,14 +41,60 @@ func ParseTorrent(data []byte) (*bencode.Torrent, error) {
 
 	infoHash := sha1.Sum(infoBytes)
 
+	announceVal, ok := decoded["announce"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing 'announce' field")
+	}
+	announce, ok := announceVal.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("'announce' field is not a string")
+	}
+
+	nameVal, ok := infoMap["name"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing 'name' field in info")
+	}
+	name, ok := nameVal.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("'name' field is not a string")
+	}
+
+	pieceLengthVal, ok := infoMap["piece length"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing 'piece length' field in info")
+	}
+	pieceLength, ok := pieceLengthVal.(int64)
+	if !ok {
+		return nil, fmt.Errorf("'piece length' field is not an integer")
+	}
+
+	piecesVal, ok := infoMap["pieces"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing 'pieces' field in info")
+	}
+	pieces, ok := piecesVal.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("'pieces' field is not a string")
+	}
+
+	// Length is optional (for multi-file torrents)
+	length := 0
+	if lengthVal, ok := infoMap["length"]; ok && lengthVal != nil {
+		lengthInt, ok := lengthVal.(int64)
+		if !ok {
+			return nil, fmt.Errorf("'length' field is not an integer")
+		}
+		length = int(lengthInt)
+	}
+
 	t := bencode.Torrent{
-		Announce: string(decoded["announce"].([]byte)),
+		Announce: string(announce),
 		InfoHash: infoHash,
 		Info: bencode.Info{
-			Name:        string(infoMap["name"].([]byte)),
-			PieceLength: int(infoMap["piece length"].(int64)),
-			Pieces:      infoMap["pieces"].([]byte),
-			Length:      int(infoMap["length"].(int64)),
+			Name:        string(name),
+			PieceLength: int(pieceLength),
+			Pieces:      pieces,
+			Length:      length,
 		},
 	}
 
