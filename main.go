@@ -42,17 +42,32 @@ func main() {
 		fmt.Println(p.IP, p.Port)
 	}
 
-	fmt.Println("\n Testing handshake")
+	fmt.Println("\nTesting handshake with first 100 peers...\n")
 
-	for _, p := range peers {
+	success := false
+	limit := 100
+	if len(peers) < limit {
+		limit = len(peers)
+	}
+
+	for i := 0; i < limit; i++ {
+		p := peers[i]
+		fmt.Printf("Trying %s:%d ... ", p.IP, p.Port)
+
 		conn, err := peer.ConnectAndHandshake(p, torrent.InfoHash, peerID)
 		if err != nil {
-			fmt.Println("Failed handshake with", p.IP, p.Port, "error:", err)
+			fmt.Println("Failed:", err)
 			continue
 		}
 
-		fmt.Println("Handshake successful with", p.IP, p.Port)
+		fmt.Println("SUCCESS")
 		conn.Close()
+		success = true
 		break
 	}
+
+	if !success {
+		fmt.Println("\nNo successful handshake in first", limit, "peers")
+	}
+
 }
