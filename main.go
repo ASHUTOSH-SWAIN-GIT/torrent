@@ -30,11 +30,6 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println("Main tracker:", t.Announce)
-	if len(t.AnnounceList) > 0 {
-		fmt.Printf("Additional tracker tiers: %d\n", len(t.AnnounceList))
-	}
-
 	peerID := tracker.GeneratePeerID()
 
 	// Query all trackers concurrently and get combined peer list
@@ -56,8 +51,6 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-
-	fmt.Println("Starting download...")
 
 	if err := sess.DownloadAll(allPeers); err != nil {
 		fmt.Println("Download failed:", err)

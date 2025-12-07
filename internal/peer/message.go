@@ -149,6 +149,7 @@ func SendPiece(w io.Writer, index int, begin int, block []byte) error {
 func SendUnchoke(w io.Writer) error {
 	buf := make([]byte, 5)
 	binary.BigEndian.PutUint32(buf[0:4], 1)
+	buf[4] = MsgUnchoke
 	_, err := w.Write(buf)
 	return err
 }

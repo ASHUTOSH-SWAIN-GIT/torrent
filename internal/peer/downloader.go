@@ -22,62 +22,82 @@ func SendRequest(w io.Writer, index int, begin int, length int) error {
 	return err
 }
 
-func ReadPiece(conn net.Conn) (index int, begin int, block []byte, err error) {
+// ReadPiece reads a piece message from the dispatcher matching the expected piece index and offset
+func ReadPiece(dispatcher *MessageDispatcher, expectedIndex int, expectedBegin int, timeout time.Duration) (index int, begin int, block []byte, err error) {
+	deadline := time.Now().Add(timeout)
+
 	for {
-		msg, err := ReadMessage(conn)
-		if err != nil {
-			return 0, 0, nil, err
+		// Check timeout
+		if time.Now().After(deadline) {
+			return 0, 0, nil, fmt.Errorf("timeout waiting for piece message (piece %d, offset %d)", expectedIndex, expectedBegin)
 		}
 
-		if msg == nil {
-			// keepalive ignore
-			continue
-		}
-
-		switch msg.ID {
-		case MsgPiece:
+		select {
+		case msg, ok := <-dispatcher.GetPieceChannel():
+			if !ok {
+				return 0, 0, nil, fmt.Errorf("dispatcher closed")
+			}
 			if len(msg.Payload) < 8 {
-				return 0, 0, nil, fmt.Errorf("piece payload too small")
+				// Invalid message, skip it
+				continue
 			}
 
 			index = int(binary.BigEndian.Uint32(msg.Payload[0:4]))
 			begin = int(binary.BigEndian.Uint32(msg.Payload[4:8]))
 			block = msg.Payload[8:]
-			return index, begin, block, nil
 
-		case MsgChoke:
-			// Wait for unchoke again
-			if err := WaitForUnchoke(conn); err != nil {
-				return 0, 0, nil, fmt.Errorf("peer choked us: %w", err)
+			// Check if it matches what we requested
+			if index == expectedIndex && begin == expectedBegin {
+				return index, begin, block, nil
 			}
+
+			// Mismatch - this shouldn't happen with sequential downloads
+			// But if it does, count mismatches and give up after too many
+			// This prevents infinite loops if peer sends wrong pieces
+			// Note: We can't easily buffer mismatched pieces, so we skip them
+			// The correct piece should arrive eventually if peer is behaving correctly
 			continue
 
-		case MsgUnchoke:
-			// ready now keep reading next message
+		case choked := <-dispatcher.GetChokeChannel():
+			if choked {
+				// We got choked, wait for unchoke
+				unchoked := false
+				for !unchoked {
+					select {
+					case unchokeState := <-dispatcher.GetChokeChannel():
+						if !unchokeState {
+							// Unchoked, continue waiting for piece
+							unchoked = true
+						}
+					case err := <-dispatcher.GetErrorChannel():
+						return 0, 0, nil, fmt.Errorf("peer choked us: %w", err)
+					case <-time.After(time.Until(deadline)):
+						return 0, 0, nil, fmt.Errorf("timeout waiting for unchoke")
+					}
+				}
+			}
+			// Unchoked, continue waiting for piece
 			continue
 
-		case MsgHave:
-			// ignored for now, high level does not track availability yet
-			continue
+		case err := <-dispatcher.GetErrorChannel():
+			return 0, 0, nil, err
 
-		case MsgBitfield:
-			// already read at start, ignore extras for now
-			continue
-
-		default:
-			continue
+		case <-time.After(time.Until(deadline)):
+			return 0, 0, nil, fmt.Errorf("timeout waiting for piece message (piece %d, offset %d)", expectedIndex, expectedBegin)
 		}
 	}
 }
 
-// sends request for a whole block and reads the matching piece
-func DownloadBlock(conn net.Conn, pieceIndex int, begin int, length int) ([]byte, error) {
-	// send request for the block
+// DownloadBlock sends request and reads matching piece using dispatcher
+func DownloadBlock(conn net.Conn, dispatcher *MessageDispatcher, pieceIndex int, begin int, length int) ([]byte, error) {
+	// Send request for the block
 	if err := SendRequest(conn, pieceIndex, begin, length); err != nil {
 		return nil, err
 	}
 
-	_, blkBegin, blkData, err := ReadPiece(conn)
+	// Read piece with timeout - increased to 15s for slow connections (128KB can take time)
+	// Also handles out-of-order pieces gracefully
+	_, blkBegin, blkData, err := ReadPiece(dispatcher, pieceIndex, begin, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -105,32 +125,79 @@ func PrepareConnection(conn net.Conn) error {
 	return WaitForUnchoke(conn)
 }
 
-// downloads a torrent piece by requesting blocks
-func DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int) ([]byte, error) {
+// WaitForUnchokeDispatcher waits for unchoke message using dispatcher
+func WaitForUnchokeDispatcher(dispatcher *MessageDispatcher, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for unchoke")
+		}
+
+		select {
+		case choked := <-dispatcher.GetChokeChannel():
+			if !choked {
+				// Unchoked!
+				return nil
+			}
+			// Choked, wait for unchoke
+			select {
+			case unchoked := <-dispatcher.GetChokeChannel():
+				if !unchoked {
+					return nil
+				}
+			case err := <-dispatcher.GetErrorChannel():
+				return fmt.Errorf("peer choked us: %w", err)
+			case <-time.After(time.Until(deadline)):
+				return fmt.Errorf("timeout waiting for unchoke")
+			}
+
+		case err := <-dispatcher.GetErrorChannel():
+			return err
+
+		case <-time.After(time.Until(deadline)):
+			return fmt.Errorf("timeout waiting for unchoke")
+		}
+	}
+}
+
+// DownloadPiece downloads a torrent piece by requesting blocks using dispatcher
+func DownloadPiece(conn net.Conn, dispatcher *MessageDispatcher, pieceIndex int, pieceLength int) ([]byte, error) {
 	buf := make([]byte, pieceLength)
 	offset := 0
 
-	// Wait for unchoke before starting (peer might have choked us)
-	// Set very short timeout - if peer doesn't unchoke quickly, try another peer
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if err := WaitForUnchoke(conn); err != nil {
-		return nil, err
-	}
-	conn.SetReadDeadline(time.Time{})
+	// Wait for unchoke before starting using dispatcher
+	unchokeTimeout := 10 * time.Second // Increased timeout for unchoke (some peers are slow)
+	unchoked := false
 
-	// Download blocks sequentially with aggressive timeouts
-	// Large blocks (128KB) + short timeouts = fast downloads from good peers, quick failure on bad ones
+	// Check if we're already unchoked by checking choke channel (non-blocking)
+	select {
+	case choked := <-dispatcher.GetChokeChannel():
+		unchoked = !choked
+	default:
+		// No message yet, wait for unchoke
+		if err := WaitForUnchokeDispatcher(dispatcher, unchokeTimeout); err != nil {
+			return nil, err
+		}
+		unchoked = true
+	}
+
+	if !unchoked {
+		// Wait for unchoke
+		if err := WaitForUnchokeDispatcher(dispatcher, unchokeTimeout); err != nil {
+			return nil, err
+		}
+	}
+
+	// Download blocks sequentially
 	for offset < pieceLength {
 		blockSize := DefaultBlockSize
 		if offset+blockSize > pieceLength {
 			blockSize = pieceLength - offset
 		}
 
-		// Very short timeout - fail fast on slow peers (3 seconds for 128KB is reasonable)
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
-		block, err := DownloadBlock(conn, pieceIndex, offset, blockSize)
+		block, err := DownloadBlock(conn, dispatcher, pieceIndex, offset, blockSize)
 		if err != nil {
-			conn.SetDeadline(time.Time{})
 			return nil, err
 		}
 
@@ -138,37 +205,25 @@ func DownloadPiece(conn net.Conn, pieceIndex int, pieceLength int) ([]byte, erro
 		offset += blockSize
 	}
 
-	conn.SetDeadline(time.Time{})
-
-	conn.SetDeadline(time.Time{})
 	return buf, nil
 }
 
-// listens for pieces from the peers and  serves them , runs concurrently with downloading
-func HandleUploadRequests(conn net.Conn, getPieceData func(int) ([]byte, error), hasPiece func(int) bool) error {
-	// send unchoke to  allow  peer to download  from us
+// HandleUploadRequests listens for Request messages and serves pieces using dispatcher
+func HandleUploadRequests(conn net.Conn, dispatcher *MessageDispatcher, getPieceData func(int) ([]byte, error), hasPiece func(int) bool) error {
+	// Send unchoke to allow peer to download from us
 	if err := SendUnchoke(conn); err != nil {
 		return err
 	}
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		msg, err := ReadMessage(conn)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				conn.SetReadDeadline(time.Time{})
-				continue
+		select {
+		case msg, ok := <-dispatcher.GetRequestChannel():
+			if !ok {
+				// Channel closed
+				return nil
 			}
-			return err
-		}
-		conn.SetReadDeadline(time.Time{})
-		if msg == nil {
-			continue //keepalive
-		}
 
-		switch msg.ID {
-		case MsgRequest:
-			// parse the request from the peer
+			// Parse the request from the peer
 			if len(msg.Payload) < 12 {
 				continue
 			}
@@ -177,7 +232,7 @@ func HandleUploadRequests(conn net.Conn, getPieceData func(int) ([]byte, error),
 			reqBegin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
 			reqLength := int(binary.BigEndian.Uint32(msg.Payload[8:12]))
 
-			// serve the piece if we have that
+			// Serve the piece if we have it
 			if hasPiece(reqIndex) {
 				pieceData, err := getPieceData(reqIndex)
 				if err != nil {
@@ -187,22 +242,19 @@ func HandleUploadRequests(conn net.Conn, getPieceData func(int) ([]byte, error),
 				if reqBegin+reqLength > len(pieceData) {
 					continue
 				}
-				// send the piece block
+
+				// Send the piece block
 				block := pieceData[reqBegin : reqBegin+reqLength]
 				if err := SendPiece(conn, reqIndex, reqBegin, block); err != nil {
 					return err
 				}
 			}
-		case MsgChoke:
-			// peer choked us we cant download but can upload to them
-			continue
-		case MsgUnchoke:
-			continue
-		case MsgInterested:
-			continue
-		case MsgNotInterested:
-			continue
-		default:
+
+		case err := <-dispatcher.GetErrorChannel():
+			return err
+
+		case <-time.After(30 * time.Second):
+			// Timeout - continue listening (keepalive check)
 			continue
 		}
 	}

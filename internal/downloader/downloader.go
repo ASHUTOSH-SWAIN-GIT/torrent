@@ -191,10 +191,7 @@ func (s *Session) connectToPeersBatch(peers []tracker.Peer, maxPeers int, existi
 
 	wgConn.Wait()
 
-	// Log connection results
-	fmt.Printf("Connected peers: %d/%d (attempted %d, success rate: %.1f%%)\n",
-		len(conns), len(peers), atomic.LoadInt32(&attempts),
-		float64(atomic.LoadInt32(&successes))/float64(atomic.LoadInt32(&attempts))*100)
+	// Don't log connection results - too verbose
 
 	return conns
 }
@@ -210,26 +207,22 @@ func (s *Session) DownloadAll(initialPeers []tracker.Peer) error {
 
 	fmt.Println("Total pieces:", numPieces)
 
-	maxPeers := 40 // Maximum connections to keep (increased for better parallelization)
+	maxPeers := 50 // Maximum connections to keep (increased to maintain 20+ active)
 
 	// Initial connection batch - try to get as many as possible
-	fmt.Printf("Attempting to connect to %d peers from trackers...\n", len(initialPeers))
 	conns := s.connectToPeersBatch(initialPeers, maxPeers, 0)
 
 	if len(conns) == 0 {
 		return fmt.Errorf("could not connect to any peers")
 	}
 
-	fmt.Printf("Initial connected peers: %d\n", len(conns))
-
 	// If we got very few peers initially, immediately try to get more
-	if len(conns) < 15 {
+	if len(conns) < 20 {
 		// Immediately re-announce to get more peers
 		newPeers, err := tracker.AnnounceAll(s.Torrent, s.PeerID, s.port)
 		if err == nil && len(newPeers) > 0 {
 			additionalConns := s.connectToPeersBatch(newPeers, maxPeers, len(conns))
 			conns = append(conns, additionalConns...)
-			fmt.Printf("Total connected peers after re-announce: %d\n", len(conns))
 		}
 	}
 
@@ -264,8 +257,8 @@ func (s *Session) DownloadAll(initialPeers []tracker.Peer) error {
 	}
 
 	// Background goroutine to periodically re-announce to trackers and get fresh peers
-	// Start with aggressive re-announcing (every 5 seconds) if we have few peers
-	reconnectTicker := time.NewTicker(5 * time.Second) // Start aggressive
+	// Start with aggressive re-announcing (every 3 seconds) to maintain 20+ peers
+	reconnectTicker := time.NewTicker(3 * time.Second) // Start aggressive
 	defer reconnectTicker.Stop()
 
 	doneCh := make(chan struct{})
@@ -278,23 +271,8 @@ func (s *Session) DownloadAll(initialPeers []tracker.Peer) error {
 				// Check current active peer count
 				currentConnCount := getActiveConnectionCount()
 
-				// Adjust re-announce interval based on peer count
-				if currentConnCount >= 20 {
-					// We have enough peers, slow down re-announcing
-					reconnectTicker.Reset(15 * time.Second)
-				} else if currentConnCount < 10 {
-					// Very few peers, be very aggressive
-					reconnectTicker.Reset(5 * time.Second)
-				} else {
-					// Moderate peer count
-					reconnectTicker.Reset(10 * time.Second)
-				}
-
-				// Always re-announce if we're below threshold
+				// Always maintain at least 20 active peers
 				targetPeers := 20
-				if currentConnCount < 10 {
-					targetPeers = 15 // More aggressive if we're really low
-				}
 				if currentConnCount < targetPeers {
 					// Re-announce to all trackers (silently)
 					newPeers, err := tracker.AnnounceAll(s.Torrent, s.PeerID, s.port)
@@ -318,10 +296,7 @@ func (s *Session) DownloadAll(initialPeers []tracker.Peer) error {
 						// Add new connections to the pool
 						s.connsMu.Lock()
 						s.conns = append(s.conns, newConns...)
-						newTotal := len(s.conns)
 						s.connsMu.Unlock()
-
-						fmt.Printf("Total connected peers: %d (added %d new)\n", newTotal, len(newConns))
 
 						// Start workers for new connections
 						for _, newConn := range newConns {
@@ -331,6 +306,18 @@ func (s *Session) DownloadAll(initialPeers []tracker.Peer) error {
 								downloaded, numPieces, pieceCh, &lastProgressTime, &progressMu)
 						}
 					}
+				}
+
+				// Adjust re-announce interval based on peer count
+				if currentConnCount >= 25 {
+					// We have enough peers, slow down re-announcing
+					reconnectTicker.Reset(15 * time.Second)
+				} else if currentConnCount < 15 {
+					// Very few peers, be very aggressive
+					reconnectTicker.Reset(3 * time.Second)
+				} else {
+					// Moderate peer count
+					reconnectTicker.Reset(5 * time.Second)
 				}
 
 			case <-doneCh:
@@ -392,12 +379,32 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 	defer atomic.AddInt32(activeWorkers, -1)
 	defer conn.Close()
 
-	// Remove connection from list when worker exits (only on fatal errors)
-	// We'll remove it in the error handling, not in defer
+	// Create message dispatcher - single reader for all messages
+	dispatcher := peer.NewMessageDispatcher(conn)
+	dispatcher.Start()
+	defer dispatcher.Close()
+
+	// Start upload handler in background goroutine
+	uploadWg := sync.WaitGroup{}
+	uploadWg.Add(1)
+	go func() {
+		defer uploadWg.Done()
+		// hasPiece checks if we have the piece
+		hasPiece := func(index int) bool {
+			return index >= 0 && index < len(downloaded) && downloaded[index]
+		}
+		// getPieceData reads piece from file
+		getPieceData := func(index int) ([]byte, error) {
+			return s.getPieceData(index)
+		}
+		// Handle uploads using dispatcher
+		_ = peer.HandleUploadRequests(conn, dispatcher, getPieceData, hasPiece)
+	}()
 
 	for {
 		// Check if all pieces are downloaded
 		if atomic.LoadInt32(downloadedCount) >= int32(numPieces) {
+			uploadWg.Wait() // Wait for upload handler
 			return
 		}
 
@@ -405,7 +412,8 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 		select {
 		case pieceIndex, ok := <-pieceCh:
 			if !ok {
-				return // Channel closed
+				uploadWg.Wait() // Wait for upload handler
+				return          // Channel closed
 			}
 
 			// Skip if already downloaded
@@ -413,11 +421,20 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 				continue
 			}
 
-			// Try to download the piece
-			err := s.downloadoOnePieceFromPeer(conn, pieceIndex)
-			if err != nil {
+			// Try to download the piece using dispatcher
+			// Retry up to 2 times before giving up on this peer
+			maxRetries := 2
+			retryCount := 0
+			var err error
+			
+			for retryCount <= maxRetries {
+				err = s.downloadoOnePieceFromPeer(conn, dispatcher, pieceIndex)
+				if err == nil {
+					break // Success!
+				}
+				
 				atomic.AddInt32(errorCount, 1)
-
+				
 				// Only exit on fatal connection errors
 				if isConnectionDead(err) {
 					// Connection is dead, remove from list and exit worker
@@ -429,11 +446,19 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 						}
 					}
 					s.connsMu.Unlock()
+					uploadWg.Wait() // Wait for upload handler
 					return
 				}
-
-				// For other errors (choke, timeout, etc), put piece back in queue and continue
-				// Worker stays alive and tries next piece - connection might still be good
+				
+				retryCount++
+				if retryCount <= maxRetries {
+					// Wait a bit before retrying (exponential backoff)
+					time.Sleep(time.Duration(retryCount) * 500 * time.Millisecond)
+				}
+			}
+			
+			if err != nil {
+				// Failed after retries, put piece back in queue for another peer
 				select {
 				case pieceCh <- pieceIndex:
 					// Piece requeued, continue to next piece with same peer
@@ -449,6 +474,9 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 			if !downloaded[pieceIndex] {
 				downloaded[pieceIndex] = true
 				newCount := atomic.AddInt32(downloadedCount, 1)
+
+				// Broadcast Have message to all peers
+				s.broadcastHave(pieceIndex)
 
 				// Print progress periodically
 				progressMu.Lock()
@@ -469,14 +497,15 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 		case <-time.After(500 * time.Millisecond):
 			// Very short timeout - check if we should continue (faster piece pickup)
 			if atomic.LoadInt32(downloadedCount) >= int32(numPieces) {
+				uploadWg.Wait() // Wait for upload handler
 				return
 			}
 		}
 	}
 }
 
-// download a single piece from the peer over one connection
-func (s *Session) downloadoOnePieceFromPeer(conn net.Conn, pieceIndex int) error {
+// download a single piece from the peer over one connection using dispatcher
+func (s *Session) downloadoOnePieceFromPeer(conn net.Conn, dispatcher *peer.MessageDispatcher, pieceIndex int) error {
 	pieceLen := s.Torrent.Info.PieceLength
 
 	if pieceIndex == s.Torrent.NumPieces-1 {
@@ -485,9 +514,7 @@ func (s *Session) downloadoOnePieceFromPeer(conn net.Conn, pieceIndex int) error
 		pieceLen = remaining
 	}
 
-	// Don't print every piece download - too verbose
-
-	data, err := peer.DownloadPiece(conn, pieceIndex, pieceLen)
+	data, err := peer.DownloadPiece(conn, dispatcher, pieceIndex, pieceLen)
 	if err != nil {
 		return err
 	}
@@ -509,6 +536,6 @@ func (s *Session) downloadoOnePieceFromPeer(conn net.Conn, pieceIndex int) error
 		return err
 	}
 
-	fmt.Println("Piece", pieceIndex, "done")
+	// Don't print individual piece completion - too verbose
 	return nil
 }

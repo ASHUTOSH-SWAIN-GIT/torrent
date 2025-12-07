@@ -280,9 +280,7 @@ done:
 		uniquePeers = append(uniquePeers, peer)
 	}
 
-	// Log peer count from trackers
-	fmt.Printf("Peers from trackers: %d unique peers (from %d/%d successful trackers)\n",
-		len(uniquePeers), successCount, len(trackers))
+	// Don't log peer count - too verbose
 
 	if len(uniquePeers) == 0 {
 		return nil, fmt.Errorf("all trackers failed or returned no peers")

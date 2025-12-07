@@ -66,7 +66,12 @@ func (ts *TorrentSession) DownloadAll() error {
 			pieceLen = remaining
 		}
 
-		data, err := peer.DownloadPiece(conn, i, pieceLen)
+		// Create dispatcher for this connection
+		dispatcher := peer.NewMessageDispatcher(conn)
+		dispatcher.Start()
+		defer dispatcher.Close()
+
+		data, err := peer.DownloadPiece(conn, dispatcher, i, pieceLen)
 		conn.Close()
 
 		if err != nil {
