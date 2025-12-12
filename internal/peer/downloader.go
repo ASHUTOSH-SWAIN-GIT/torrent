@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
-const DefaultBlockSize = 128 * 1024 // Increased to 128KB for maximum throughput
+const DefaultBlockSize = 128 * 1024 // block size received from the peers
+const MaxPipelineRequests = 5       // no of block downloads parallely
+const BlockTimeout = 8 * time.Second
 
 func SendRequest(w io.Writer, index int, begin int, length int) error {
 	buf := make([]byte, 17)
@@ -22,9 +25,67 @@ func SendRequest(w io.Writer, index int, begin int, length int) error {
 	return err
 }
 
-// ReadPiece reads a piece message from the dispatcher matching the expected piece index and offset
-func ReadPiece(dispatcher *MessageDispatcher, expectedIndex int, expectedBegin int, timeout time.Duration) (index int, begin int, block []byte, err error) {
+// PieceBuffer stores out-of-order pieces for pipelined downloads
+type PieceBuffer struct {
+	mu      sync.Mutex
+	pieces  map[string]*Message // key: "index:begin"
+	maxSize int
+}
+
+func NewPieceBuffer(maxSize int) *PieceBuffer {
+	return &PieceBuffer{
+		pieces:  make(map[string]*Message),
+		maxSize: maxSize,
+	}
+}
+
+func (pb *PieceBuffer) Put(index int, begin int, msg *Message) bool {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	// Don't buffer if full (shouldn't happen with proper pipelining)
+	if len(pb.pieces) >= pb.maxSize {
+		return false
+	}
+
+	key := fmt.Sprintf("%d:%d", index, begin)
+	pb.pieces[key] = msg
+	return true
+}
+
+func (pb *PieceBuffer) Get(index int, begin int) (*Message, bool) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	key := fmt.Sprintf("%d:%d", index, begin)
+	msg, ok := pb.pieces[key]
+	if ok {
+		delete(pb.pieces, key)
+	}
+	return msg, ok
+}
+
+func (pb *PieceBuffer) Clear() {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.pieces = make(map[string]*Message)
+}
+
+// ReadPiece reads a piece message from the dispatcher or buffer
+func ReadPiece(dispatcher *MessageDispatcher, buffer *PieceBuffer, expectedIndex int, expectedBegin int, timeout time.Duration) (index int, begin int, block []byte, err error) {
 	deadline := time.Now().Add(timeout)
+
+	// First check buffer for out-of-order pieces
+	if buffer != nil {
+		if msg, ok := buffer.Get(expectedIndex, expectedBegin); ok {
+			if len(msg.Payload) >= 8 {
+				index = int(binary.BigEndian.Uint32(msg.Payload[0:4]))
+				begin = int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+				block = msg.Payload[8:]
+				return index, begin, block, nil
+			}
+		}
+	}
 
 	for {
 		// Check timeout
@@ -51,11 +112,11 @@ func ReadPiece(dispatcher *MessageDispatcher, expectedIndex int, expectedBegin i
 				return index, begin, block, nil
 			}
 
-			// Mismatch - this shouldn't happen with sequential downloads
-			// But if it does, count mismatches and give up after too many
-			// This prevents infinite loops if peer sends wrong pieces
-			// Note: We can't easily buffer mismatched pieces, so we skip them
-			// The correct piece should arrive eventually if peer is behaving correctly
+			// Mismatch - buffer it for later use (pipelining)
+			if buffer != nil {
+				buffer.Put(index, begin, msg)
+			}
+			// Continue waiting for the correct piece
 			continue
 
 		case choked := <-dispatcher.GetChokeChannel():
@@ -88,16 +149,15 @@ func ReadPiece(dispatcher *MessageDispatcher, expectedIndex int, expectedBegin i
 	}
 }
 
-// DownloadBlock sends request and reads matching piece using dispatcher
-func DownloadBlock(conn net.Conn, dispatcher *MessageDispatcher, pieceIndex int, begin int, length int) ([]byte, error) {
+// DownloadBlock sends request and reads matching piece using dispatcher and buffer
+func DownloadBlock(conn net.Conn, dispatcher *MessageDispatcher, buffer *PieceBuffer, pieceIndex int, begin int, length int) ([]byte, error) {
 	// Send request for the block
 	if err := SendRequest(conn, pieceIndex, begin, length); err != nil {
 		return nil, err
 	}
 
-	// Read piece with timeout - increased to 15s for slow connections (128KB can take time)
-	// Also handles out-of-order pieces gracefully
-	_, blkBegin, blkData, err := ReadPiece(dispatcher, pieceIndex, begin, 15*time.Second)
+	// Read piece with reduced timeout for faster failure detection
+	_, blkBegin, blkData, err := ReadPiece(dispatcher, buffer, pieceIndex, begin, BlockTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -161,48 +221,235 @@ func WaitForUnchokeDispatcher(dispatcher *MessageDispatcher, timeout time.Durati
 	}
 }
 
-// DownloadPiece downloads a torrent piece by requesting blocks using dispatcher
+// DownloadPiece downloads a torrent piece using pipelined block requests
 func DownloadPiece(conn net.Conn, dispatcher *MessageDispatcher, pieceIndex int, pieceLength int) ([]byte, error) {
 	buf := make([]byte, pieceLength)
+
+	// Create buffer for out-of-order pieces
+	buffer := NewPieceBuffer(MaxPipelineRequests * 2)
+	defer buffer.Clear()
+
+	// Check cached unchoke state first (fast path)
+	if !dispatcher.IsUnchoked() {
+		// Wait for unchoke with reduced timeout
+		unchokeTimeout := 5 * time.Second
+		if err := WaitForUnchokeDispatcher(dispatcher, unchokeTimeout); err != nil {
+			return nil, err
+		}
+	}
+
+	// Calculate all blocks we need
+	type blockRequest struct {
+		offset int
+		size   int
+	}
+	var blocks []blockRequest
 	offset := 0
-
-	// Wait for unchoke before starting using dispatcher
-	unchokeTimeout := 10 * time.Second // Increased timeout for unchoke (some peers are slow)
-	unchoked := false
-
-	// Check if we're already unchoked by checking choke channel (non-blocking)
-	select {
-	case choked := <-dispatcher.GetChokeChannel():
-		unchoked = !choked
-	default:
-		// No message yet, wait for unchoke
-		if err := WaitForUnchokeDispatcher(dispatcher, unchokeTimeout); err != nil {
-			return nil, err
-		}
-		unchoked = true
-	}
-
-	if !unchoked {
-		// Wait for unchoke
-		if err := WaitForUnchokeDispatcher(dispatcher, unchokeTimeout); err != nil {
-			return nil, err
-		}
-	}
-
-	// Download blocks sequentially
 	for offset < pieceLength {
 		blockSize := DefaultBlockSize
 		if offset+blockSize > pieceLength {
 			blockSize = pieceLength - offset
 		}
+		blocks = append(blocks, blockRequest{offset: offset, size: blockSize})
+		offset += blockSize
+	}
 
-		block, err := DownloadBlock(conn, dispatcher, pieceIndex, offset, blockSize)
-		if err != nil {
+	// Download blocks with pipelining
+	// Request multiple blocks in parallel, process as they arrive
+	pending := make(map[int][]byte) // offset -> block data
+	nextOffset := 0                 // Next offset we need to write
+	requested := 0                  // Number of blocks requested
+	completed := 0                  // Number of blocks completed
+
+	// Request initial batch of blocks (pipelining)
+	maxPending := MaxPipelineRequests
+	if maxPending > len(blocks) {
+		maxPending = len(blocks)
+	}
+
+	for requested < maxPending && requested < len(blocks) {
+		block := blocks[requested]
+		// Send request (non-blocking)
+		if err := SendRequest(conn, pieceIndex, block.offset, block.size); err != nil {
 			return nil, err
 		}
+		requested++
+	}
 
-		copy(buf[offset:], block)
-		offset += blockSize
+	// Process responses as they arrive (can be out of order)
+	// Use a map to track which blocks we're waiting for
+	waitingFor := make(map[int]bool) // offset -> waiting
+	for _, block := range blocks {
+		waitingFor[block.offset] = true
+	}
+
+	for completed < len(blocks) {
+		// Read ANY piece that arrives (pipelining allows out-of-order)
+		// We'll match it to the block we need
+		var receivedOffset int
+		var receivedData []byte
+
+		// Try to get from buffer first (out-of-order pieces)
+		foundInBuffer := false
+		for offset := range waitingFor {
+			if msg, ok := buffer.Get(pieceIndex, offset); ok {
+				if len(msg.Payload) >= 8 {
+					receivedOffset = int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+					receivedData = msg.Payload[8:]
+					foundInBuffer = true
+					break
+				}
+			}
+		}
+
+		if !foundInBuffer {
+			// Read from dispatcher - accept any block we're waiting for
+			// Use timeout per block, but allow multiple blocks to arrive
+			deadline := time.Now().Add(BlockTimeout)
+			received := false
+
+			for !received && time.Now().Before(deadline) {
+				select {
+				case msg, ok := <-dispatcher.GetPieceChannel():
+					if !ok {
+						return nil, fmt.Errorf("dispatcher closed")
+					}
+					if len(msg.Payload) < 8 {
+						continue
+					}
+
+					msgIndex := int(binary.BigEndian.Uint32(msg.Payload[0:4]))
+					msgOffset := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+					msgData := msg.Payload[8:]
+
+					// Check if this is a block we're waiting for
+					if msgIndex == pieceIndex && waitingFor[msgOffset] {
+						receivedOffset = msgOffset
+						receivedData = msgData
+						received = true
+					} else if msgIndex == pieceIndex {
+						// Wrong offset but same piece - buffer it for later
+						buffer.Put(msgIndex, msgOffset, msg)
+					}
+					// Otherwise ignore (wrong piece - might be from different piece download)
+
+				case choked := <-dispatcher.GetChokeChannel():
+					if choked {
+						// Got choked, wait for unchoke (but don't wait too long)
+						unchokeDeadline := time.Now().Add(3 * time.Second)
+						unchoked := false
+						for !unchoked && time.Now().Before(unchokeDeadline) {
+							select {
+							case unchokeState := <-dispatcher.GetChokeChannel():
+								if !unchokeState {
+									unchoked = true
+								}
+							case <-time.After(time.Until(unchokeDeadline)):
+								return nil, fmt.Errorf("timeout waiting for unchoke")
+							}
+						}
+						if !unchoked {
+							return nil, fmt.Errorf("timeout waiting for unchoke")
+						}
+					}
+
+				case err := <-dispatcher.GetErrorChannel():
+					return nil, err
+
+				case <-time.After(100 * time.Millisecond):
+					// Short timeout to check if we should continue
+					// This allows us to check buffer again
+					if time.Now().After(deadline) {
+						// Real timeout - return error for first waiting block
+						for offset := range waitingFor {
+							return nil, fmt.Errorf("timeout waiting for block at offset %d", offset)
+						}
+						return nil, fmt.Errorf("timeout waiting for piece blocks")
+					}
+					// Check buffer again (might have received out-of-order piece)
+					for offset := range waitingFor {
+						if msg, ok := buffer.Get(pieceIndex, offset); ok {
+							if len(msg.Payload) >= 8 {
+								receivedOffset = int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+								receivedData = msg.Payload[8:]
+								received = true
+								break
+							}
+						}
+					}
+				}
+			}
+
+			if !received {
+				// Final check of buffer before giving up
+				for offset := range waitingFor {
+					if msg, ok := buffer.Get(pieceIndex, offset); ok {
+						if len(msg.Payload) >= 8 {
+							receivedOffset = int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+							receivedData = msg.Payload[8:]
+							received = true
+							break
+						}
+					}
+				}
+				if !received {
+					// Return error for first waiting block
+					for offset := range waitingFor {
+						return nil, fmt.Errorf("timeout waiting for block at offset %d", offset)
+					}
+					return nil, fmt.Errorf("timeout waiting for piece blocks")
+				}
+			}
+		}
+
+		// Find the block this data belongs to
+		var block blockRequest
+		foundBlock := false
+		for _, b := range blocks {
+			if b.offset == receivedOffset {
+				block = b
+				foundBlock = true
+				break
+			}
+		}
+
+		if !foundBlock {
+			continue // Shouldn't happen, but skip if it does
+		}
+
+		if len(receivedData) != block.size {
+			return nil, fmt.Errorf("unexpected block length got %d want %d", len(receivedData), block.size)
+		}
+
+		// Store block (may be out of order)
+		pending[block.offset] = receivedData
+		delete(waitingFor, block.offset)
+		completed++
+
+		// Write blocks in order as they become available
+		for nextOffset < pieceLength {
+			if blockData, ok := pending[nextOffset]; ok {
+				blockSize := DefaultBlockSize
+				if nextOffset+blockSize > pieceLength {
+					blockSize = pieceLength - nextOffset
+				}
+				copy(buf[nextOffset:], blockData)
+				delete(pending, nextOffset)
+				nextOffset += blockSize
+			} else {
+				break // Wait for next block
+			}
+		}
+
+		// Request next block to maintain pipeline
+		if requested < len(blocks) {
+			nextBlock := blocks[requested]
+			if err := SendRequest(conn, pieceIndex, nextBlock.offset, nextBlock.size); err != nil {
+				return nil, err
+			}
+			waitingFor[nextBlock.offset] = true
+			requested++
+		}
 	}
 
 	return buf, nil

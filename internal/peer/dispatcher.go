@@ -18,6 +18,9 @@ type MessageDispatcher struct {
 	wg        sync.WaitGroup
 	mu        sync.Mutex
 	closed    bool
+	// Cached unchoke state for fast access
+	unchokeMu sync.RWMutex
+	unchoked  bool // true if we're unchoked
 }
 
 // NewMessageDispatcher creates a new message dispatcher for a connection
@@ -29,6 +32,7 @@ func NewMessageDispatcher(conn net.Conn) *MessageDispatcher {
 		chokeCh:   make(chan bool, 5), // Increased buffer for choke messages
 		errCh:     make(chan error, 1),
 		doneCh:    make(chan struct{}),
+		unchoked:  false, // Assume choked initially
 	}
 }
 
@@ -97,6 +101,10 @@ func (md *MessageDispatcher) readLoop() {
 			}
 
 		case MsgChoke:
+			// Update cached unchoke state
+			md.unchokeMu.Lock()
+			md.unchoked = false
+			md.unchokeMu.Unlock()
 			// Notify about choke state (true = choked)
 			select {
 			case md.chokeCh <- true:
@@ -107,6 +115,10 @@ func (md *MessageDispatcher) readLoop() {
 			}
 
 		case MsgUnchoke:
+			// Update cached unchoke state
+			md.unchokeMu.Lock()
+			md.unchoked = true
+			md.unchokeMu.Unlock()
 			// Notify about unchoke state (false = unchoked)
 			select {
 			case md.chokeCh <- false:
@@ -158,4 +170,11 @@ func (md *MessageDispatcher) GetChokeChannel() <-chan bool {
 // GetErrorChannel returns the channel for errors
 func (md *MessageDispatcher) GetErrorChannel() <-chan error {
 	return md.errCh
+}
+
+// IsUnchoked returns the cached unchoke state (thread-safe)
+func (md *MessageDispatcher) IsUnchoked() bool {
+	md.unchokeMu.RLock()
+	defer md.unchokeMu.RUnlock()
+	return md.unchoked
 }

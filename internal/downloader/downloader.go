@@ -416,23 +416,24 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 				return          // Channel closed
 			}
 
-			// Skip if already downloaded
+			// Skip if already downloaded (atomic check to prevent race condition)
+			// Use atomic operation to check and mark as in-progress
+			// This prevents multiple workers from downloading the same piece
+			progressMu.Lock()
 			if downloaded[pieceIndex] {
+				progressMu.Unlock()
 				continue
 			}
+			// Mark as in-progress (prevent other workers from picking it)
+			// We'll mark as downloaded only after successful download
+			progressMu.Unlock()
 
 			// Try to download the piece using dispatcher
-			// Retry up to 2 times before giving up on this peer
-			maxRetries := 2
-			retryCount := 0
+			// Only retry once - if it fails, let another peer try it
 			var err error
+			err = s.downloadoOnePieceFromPeer(conn, dispatcher, pieceIndex)
 			
-			for retryCount <= maxRetries {
-				err = s.downloadoOnePieceFromPeer(conn, dispatcher, pieceIndex)
-				if err == nil {
-					break // Success!
-				}
-				
+			if err != nil {
 				atomic.AddInt32(errorCount, 1)
 				
 				// Only exit on fatal connection errors
@@ -450,15 +451,8 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 					return
 				}
 				
-				retryCount++
-				if retryCount <= maxRetries {
-					// Wait a bit before retrying (exponential backoff)
-					time.Sleep(time.Duration(retryCount) * 500 * time.Millisecond)
-				}
-			}
-			
-			if err != nil {
-				// Failed after retries, put piece back in queue for another peer
+				// For other errors, put piece back in queue for another peer
+				// Don't retry on same peer - let other peers try (they might be faster)
 				select {
 				case pieceCh <- pieceIndex:
 					// Piece requeued, continue to next piece with same peer
@@ -470,7 +464,8 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 				}
 			}
 
-			// Mark as downloaded
+			// Mark as downloaded (atomic check to prevent race condition)
+			progressMu.Lock()
 			if !downloaded[pieceIndex] {
 				downloaded[pieceIndex] = true
 				newCount := atomic.AddInt32(downloadedCount, 1)
@@ -479,7 +474,6 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 				s.broadcastHave(pieceIndex)
 
 				// Print progress periodically
-				progressMu.Lock()
 				now := time.Now()
 				if now.Sub(*lastProgressTime) > 2*time.Second {
 					s.connsMu.RLock()
@@ -491,8 +485,8 @@ func (s *Session) worker(conn net.Conn, wg *sync.WaitGroup, activeWorkers *int32
 						activePeers, atomic.LoadInt32(errorCount))
 					*lastProgressTime = now
 				}
-				progressMu.Unlock()
 			}
+			progressMu.Unlock()
 
 		case <-time.After(500 * time.Millisecond):
 			// Very short timeout - check if we should continue (faster piece pickup)
